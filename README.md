@@ -1,0 +1,1 @@
+# nptv6-update-server
