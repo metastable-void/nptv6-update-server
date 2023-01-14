@@ -138,10 +138,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ip6tables_template = args.ip6tables_template.clone();
     let ip6tables_output = args.ip6tables_output.clone();
     async move {
-        let addr = addr.clone();
-        Ok::<_, Infallible>(service_fn(move |req : Request<Body>| {
-            update_ip6tables(req, addr, secret.clone(), local_prefix.clone(), ip6tables_template.clone(), ip6tables_output.clone())
-        }))
+      let addr = addr.clone();
+      Ok::<_, Infallible>(service_fn(move |req : Request<Body>| {
+          update_ip6tables(req, addr, secret.clone(), local_prefix.clone(), ip6tables_template.clone(), ip6tables_output.clone())
+      }))
       }
   });
 
@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   log::info!("Listening on http://{}", &addr);
   // Run this server for... forever!
   if let Err(e) = server.await {
-      eprintln!("server error: {}", e);
+    log::error!("server error: {}", e);
   }
 
   Ok(())
