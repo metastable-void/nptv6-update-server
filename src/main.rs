@@ -5,6 +5,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
+// TODO: Use POST
+
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -14,7 +17,7 @@ use hyper::server::conn::AddrStream;
 use hyper::{Body, Request, Response, Server, Method, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
 use tokio::process::Command;
-use url::Url;
+use url::form_urlencoded::parse;
 use std::path::{PathBuf, Path};
 use serde_json::{json, Value};
 use clap_verbosity_flag::{Verbosity, InfoLevel};
@@ -52,10 +55,60 @@ struct RequestWithAddr {
   addr: SocketAddr,
 }
 
+impl RequestWithAddr {
+  fn new(req: Request<Body>, addr: SocketAddr) -> Self {
+    Self { req, addr }
+  }
+
+  fn addr(&self) -> &SocketAddr {
+    &self.addr
+  }
+
+  fn req_uri(&self) -> &hyper::Uri {
+    self.req.uri()
+  }
+
+  fn req_uri_path(&self) -> &str {
+    self.req.uri().path()
+  }
+
+  fn req_uri_query(&self) -> Option<&str> {
+    self.req.uri().query()
+  }
+
+  fn req_uri_query_map(&self) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if let Some(query) = self.req_uri_query() {
+      for (key, value) in parse(query.as_bytes()) {
+        map.insert(key.to_string(), value.to_string());
+      }
+    }
+    map
+  }
+
+  fn req_method(&self) -> &Method {
+    self.req.method()
+  }
+}
+
 #[derive(Clone)]
 struct Ip6tablesPaths {
   ip6tables_template: PathBuf,
   ip6tables_output: PathBuf,
+}
+
+impl Ip6tablesPaths {
+  fn new(ip6tables_template: PathBuf, ip6tables_output: PathBuf) -> Self {
+    Self { ip6tables_template, ip6tables_output }
+  }
+
+  fn template(&self) -> &Path {
+    &self.ip6tables_template
+  }
+
+  fn output(&self) -> &Path {
+    &self.ip6tables_output
+  }
 }
 
 #[derive(Clone)]
@@ -123,45 +176,38 @@ async fn run_ip6tables_restore(stdin_path: impl AsRef<Path>) -> Result<(), Servi
 }
 
 async fn update_ip6tables(req_addr: RequestWithAddr, config: Configuration) -> Result<(), ServiceError> {
-  let req = req_addr.req;
   let Configuration {secret, local_prefix, ip6tables_paths} = config;
-  let Ip6tablesPaths {ip6tables_template, ip6tables_output} = ip6tables_paths;
-  let uri = req.uri();
-  let path = uri.path();
+  let path = req_addr.req_uri_path();
   let target_path = format!("/{}", secret);
   if path != target_path {
     return Err(ServiceError::new(StatusCode::NOT_FOUND, format!("invalid path: {}", path)))
   }
 
-  let url_obj = Url::parse(&req.uri().to_string()).unwrap();
-  let params = url_obj.query_pairs();
-  let mut prefix = "".to_string();
-  for (key, value) in params {
-    if key != "prefix" {
-      continue;
-    }
-    prefix = value.to_string();
-  }
-  if prefix == "" {
+  let prefix: String;
+  if let Some(s) = req_addr.req_uri_query_map().get("prefix") {
+    prefix = s.to_string();
+  } else {
     return Err(ServiceError::new(StatusCode::BAD_REQUEST, format!("missing prefix")))
   }
 
   log::debug!("updating ip6tables rules using global prefix {}", &prefix);
+  let template_path = ip6tables_paths.template();
+  let output_path = ip6tables_paths.output();
 
   let ip6tables_template_content : String;
-  if let Ok(content) = fs::read_to_string(&ip6tables_template).await {
+  if let Ok(content) = fs::read_to_string(template_path).await {
     ip6tables_template_content = content;
   } else {
-    return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read ip6tables template: {:?}", &ip6tables_template)))
+    return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read ip6tables template: {:?}", template_path)))
   }
 
   let ip6tables = format_ip6tables(&ip6tables_template_content, &local_prefix, &prefix);
   
-  if let Err(err) = fs::write(&ip6tables_output, ip6tables).await {
-    return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write ip6tables rules: {:?} ({})", &ip6tables_output, err)))
+  if let Err(err) = fs::write(output_path, ip6tables).await {
+    return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write ip6tables rules: {:?} ({})", output_path, err)))
   }
 
-  if let Err(err) = run_ip6tables_restore(&ip6tables_output).await {
+  if let Err(err) = run_ip6tables_restore(output_path).await {
     return Err(err)
   }
   log::info!("updated ip6tables rules using global prefix: {}", &prefix);
@@ -171,18 +217,16 @@ async fn update_ip6tables(req_addr: RequestWithAddr, config: Configuration) -> R
 /// Handle incoming HTTP requests
 /// For security, this does not output on success
 async fn handle_request(req_addr: RequestWithAddr, config: Configuration) -> Result<(), ServiceError> {
-  let req = req_addr.req;
-  let addr = req_addr.addr;
-  let method = req.method();
-  let uri = req.uri();
+  let addr = req_addr.addr();
+  let method = req_addr.req_method();
+  let uri = req_addr.req_uri();
   let secret = config.secret();
 
-  log::debug!("{}: {} {}", &addr, method, uri);
+  log::debug!("{}: {} {}", addr, method, uri);
 
   let target_path = format!("/update/{}", secret);
   match (method, uri.path().to_string() == target_path) {
     (&Method::GET, true) => {
-      let req_addr = RequestWithAddr {req, addr: addr};
       update_ip6tables(req_addr, config).await
     },
 
@@ -195,7 +239,7 @@ async fn handle_request(req_addr: RequestWithAddr, config: Configuration) -> Res
     },
 
     _ => {
-      Err(ServiceError::new(StatusCode::BAD_REQUEST, format!("invalid request: {}", req.uri())))
+      Err(ServiceError::new(StatusCode::BAD_REQUEST, format!("invalid request: {}", uri)))
     }
   }
 }
@@ -235,14 +279,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     async move {
       let addr = addr.clone();
       Ok::<_, Infallible>(service_fn(move |req : Request<Body>| {
-        let req_addr = RequestWithAddr {
-          req: req,
-          addr: addr.clone(),
-        };
-        let ip6tables_paths = Ip6tablesPaths {
-          ip6tables_template: ip6tables_template.clone(),
-          ip6tables_output: ip6tables_output.clone(),
-        };
+        let req_addr = RequestWithAddr::new(req, addr.clone());
+        let ip6tables_paths = Ip6tablesPaths::new(ip6tables_template.clone(), ip6tables_output.clone());
         let config = Configuration {
           secret: secret.clone(),
           local_prefix: local_prefix.clone(),
@@ -250,7 +288,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         format_json_responce(req_addr, config)
       }))
-      }
+    }
   });
 
   let server = Server::bind(&addr).serve(make_svc);
