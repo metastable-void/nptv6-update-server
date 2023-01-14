@@ -15,7 +15,7 @@ use hyper::{Body, Request, Response, Server, Method, StatusCode};
 use hyper::service::{make_service_fn, service_fn};
 use tokio::process::Command;
 use url::Url;
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use serde_json::{json, Value};
 use clap_verbosity_flag::{Verbosity, InfoLevel};
 
@@ -91,6 +91,37 @@ fn create_json_responce(status: StatusCode, json: Value) -> Response<Body> {
     .unwrap()
 }
 
+fn format_ip6tables(template: &str, local_prefix: &str, global_prefix: &str) -> String {
+  template
+    .replace("%LOCAL_PREFIX%", &local_prefix)
+    .replace("%GLOBAL_PREFIX%", &global_prefix)
+}
+
+async fn run_ip6tables_restore(stdin_path: impl AsRef<Path>) -> Result<(), ServiceError> {
+  let ip6tables_file;
+  match fs::File::open(&stdin_path).await {
+    Ok(file) => {
+      ip6tables_file = file.into_std().await;
+    },
+    Err(err) => {
+      return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to open ip6tables rules: {:?} ({})", &stdin_path.as_ref(), err)))
+    }
+  }
+
+  match Command::new("ip6tables-restore").stdin(ip6tables_file).status().await {
+    Ok(status) => {
+      if !status.success() {
+        return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("ip6tables-restore failed: {}", status)))
+      }
+    },
+
+    Err(err) => {
+      return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to run ip6tables-restore: {}", err)))
+    }
+  }
+  Ok(())
+}
+
 async fn update_ip6tables(req_addr: RequestWithAddr, config: Configuration) -> Result<(), ServiceError> {
   let req = req_addr.req;
   let Configuration {secret, local_prefix, ip6tables_paths} = config;
@@ -124,38 +155,15 @@ async fn update_ip6tables(req_addr: RequestWithAddr, config: Configuration) -> R
     return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to read ip6tables template: {:?}", &ip6tables_template)))
   }
 
-  let ip6tables = ip6tables_template_content
-    .replace("%LOCAL_PREFIX%", &local_prefix)
-    .replace("%GLOBAL_PREFIX%", &prefix);
+  let ip6tables = format_ip6tables(&ip6tables_template_content, &local_prefix, &prefix);
   
   if let Err(err) = fs::write(&ip6tables_output, ip6tables).await {
     return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write ip6tables rules: {:?} ({})", &ip6tables_output, err)))
   }
 
-  let ip6tables_file;
-  match fs::File::open(&ip6tables_output).await {
-    Ok(file) => {
-      ip6tables_file = file.into_std().await;
-    },
-    Err(err) => {
-      return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to open ip6tables rules: {:?} ({})", &ip6tables_output, err)))
-    }
+  if let Err(err) = run_ip6tables_restore(&ip6tables_output).await {
+    return Err(err)
   }
-  match Command::new("ip6tables-restore")
-    .stdin(ip6tables_file)
-    .output()
-    .await {
-      Ok(output) => {
-        if !output.status.success() {
-          let ip6tables_output = String::from_utf8(output.stdout).unwrap_or("".to_string());
-          return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("ip6tables-restore failed with exit code {} ({:?})", output.status, &ip6tables_output)))
-        }
-      },
-      Err(err) => {
-        return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("ip6tables-restore failed with {:?}", err)))
-      }
-    }
-  
   log::info!("updated ip6tables rules using global prefix: {}", &prefix);
   Ok(())
 }
