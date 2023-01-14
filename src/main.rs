@@ -17,9 +17,9 @@ use tokio::process::Command;
 use url::Url;
 use std::path::PathBuf;
 use serde_json::{json, Value};
-use log::LevelFilter;
+use clap_verbosity_flag::{Verbosity, InfoLevel};
 
-#[derive(Parser)]
+#[derive(Debug, Parser)]
 #[clap(version)]
 struct Args {
   /// The address to listen on
@@ -42,9 +42,9 @@ struct Args {
   #[clap(short = 'o', long)]
   ip6tables_output: PathBuf,
 
-  /// The log level to use
-  #[clap(short = 'l', long, default_value = LevelFilter::Info.as_str())]
-  log_level: LevelFilter,
+  /// Tell me more (or less)
+  #[clap(flatten)]
+  verbose: Verbosity<InfoLevel>,
 }
 
 fn create_json_responce(status: u16, json: Value) -> Response<Body> {
@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   env_logger::builder()
     .default_format()
     .write_style(env_logger::WriteStyle::Never)
-    .filter_level(args.log_level)
+    .filter_level(args.verbose.log_level_filter())
     .init();
   
   let addr = SocketAddr::from_str(&args.listen).unwrap_or(SocketAddr::from(([127, 0, 0, 1], 8080)));
