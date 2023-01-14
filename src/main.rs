@@ -83,10 +83,10 @@ async fn update_ip6tables(req: Request<Body>, _addr: SocketAddr, secret: String,
   }
 
   let ip6tables_template_content : String;
-  if let Ok(content) = fs::read_to_string(ip6tables_template).await {
+  if let Ok(content) = fs::read_to_string(&ip6tables_template).await {
     ip6tables_template_content = content;
   } else {
-    log::error!("failed to read ip6tables template");
+    log::error!("failed to read ip6tables template: {:?}", &ip6tables_template);
     return Ok(create_json_responce(500, json!({
       "error": "failed to read ip6tables template",
     })));
@@ -96,19 +96,19 @@ async fn update_ip6tables(req: Request<Body>, _addr: SocketAddr, secret: String,
     .replace("%LOCAL_PREFIX%", &local_prefix)
     .replace("%GLOBAL_PREFIX%", &prefix);
   
-  if let Err(_) = fs::write(ip6tables_output.clone(), ip6tables).await {
-    log::error!("failed to write ip6tables rules");
+  if let Err(_) = fs::write(&ip6tables_output, ip6tables).await {
+    log::error!("failed to write ip6tables rules: {:?}", &ip6tables_output);
     return Ok(create_json_responce(500, json!({
       "error": "failed to write ip6tables rules",
     })));
   }
 
-  let ip6tables_file = fs::File::open(ip6tables_output).await.unwrap().into_std().await;
+  let ip6tables_file = fs::File::open(&ip6tables_output).await.unwrap().into_std().await;
   if let Err(_) = Command::new("ip6tables-restore")
     .stdin(ip6tables_file)
     .output()
     .await {
-      log::error!("ip6tables-restore failed");
+      log::error!("ip6tables-restore failed with {:?}", &ip6tables_output);
       return Ok(create_json_responce(500, json!({
         "error": "ip6tables-restore failed",
       })))
