@@ -82,6 +82,8 @@ async fn update_ip6tables(req: Request<Body>, _addr: SocketAddr, secret: String,
     })));
   }
 
+  log::debug!("updating ip6tables rules using global prefix {}", &prefix);
+
   let ip6tables_template_content : String;
   if let Ok(content) = fs::read_to_string(&ip6tables_template).await {
     ip6tables_template_content = content;
@@ -96,22 +98,44 @@ async fn update_ip6tables(req: Request<Body>, _addr: SocketAddr, secret: String,
     .replace("%LOCAL_PREFIX%", &local_prefix)
     .replace("%GLOBAL_PREFIX%", &prefix);
   
-  if let Err(_) = fs::write(&ip6tables_output, ip6tables).await {
-    log::error!("failed to write ip6tables rules: {:?}", &ip6tables_output);
+  if let Err(err) = fs::write(&ip6tables_output, ip6tables).await {
+    log::error!("failed to write ip6tables rules: {:?} ({})", &ip6tables_output, err);
     return Ok(create_json_responce(500, json!({
       "error": "failed to write ip6tables rules",
     })));
   }
 
-  let ip6tables_file = fs::File::open(&ip6tables_output).await.unwrap().into_std().await;
-  if let Err(_) = Command::new("ip6tables-restore")
+  let ip6tables_file;
+  match fs::File::open(&ip6tables_output).await {
+    Ok(file) => {
+      ip6tables_file = file.into_std().await;
+    },
+    Err(err) => {
+      log::error!("failed to open ip6tables rules: {:?} ({})", &ip6tables_output, err);
+      return Ok(create_json_responce(500, json!({
+        "error": "failed to open ip6tables rules",
+      })));
+    }
+  }
+  match Command::new("ip6tables-restore")
     .stdin(ip6tables_file)
     .output()
     .await {
-      log::error!("ip6tables-restore failed with {:?}", &ip6tables_output);
-      return Ok(create_json_responce(500, json!({
-        "error": "ip6tables-restore failed",
-      })))
+      Ok(output) => {
+        if !output.status.success() {
+          let ip6tables_output = String::from_utf8(output.stdout).unwrap_or("".to_string());
+          log::error!("ip6tables-restore failed with exit code {} ({:?})", output.status, &ip6tables_output);
+          return Ok(create_json_responce(500, json!({
+            "error": "ip6tables-restore failed",
+          })))
+        }
+      },
+      Err(err) => {
+        log::error!("ip6tables-restore failed with {:?}", err);
+        return Ok(create_json_responce(500, json!({
+          "error": "ip6tables-restore failed",
+        })))
+      }
     }
   
   log::info!("updated ip6tables rules using global prefix: {}", &prefix);
