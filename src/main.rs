@@ -68,21 +68,22 @@ impl RequestWithAddr {
     self.req.uri()
   }
 
-  fn req_uri_path(&self) -> &str {
-    self.req.uri().path()
-  }
-
-  fn req_uri_query(&self) -> Option<&str> {
-    self.req.uri().query()
-  }
-
-  fn req_uri_query_map(&self) -> HashMap<String, String> {
+  async fn req_body_query_map(&mut self) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    if let Some(query) = self.req_uri_query() {
-      for (key, value) in parse(query.as_bytes()) {
+    if let Some(mime) = self.req.headers().get("Content-Type") {
+      if "application/x-www-form-urlencoded" != mime.to_str().unwrap() {
+        return map;
+      }
+    } else {
+      return map;
+    }
+    
+    if let Ok(bytes) = hyper::body::to_bytes(self.req.body_mut()).await {
+      for (key, value) in parse(&bytes) {
         map.insert(key.to_string(), value.to_string());
       }
     }
+    
     map
   }
 
@@ -175,16 +176,23 @@ async fn run_ip6tables_restore(stdin_path: impl AsRef<Path>) -> Result<(), Servi
   Ok(())
 }
 
-async fn update_ip6tables(req_addr: RequestWithAddr, config: Configuration) -> Result<(), ServiceError> {
-  let Configuration {secret, local_prefix, ip6tables_paths} = config;
-  let path = req_addr.req_uri_path();
-  let target_path = format!("/{}", secret);
-  if path != target_path {
-    return Err(ServiceError::new(StatusCode::NOT_FOUND, format!("invalid path: {}", path)))
+async fn update_ip6tables(mut req_addr: RequestWithAddr, config: Configuration) -> Result<(), ServiceError> {
+  let local_prefix = &config.local_prefix;
+  let ip6tables_paths = &config.ip6tables_paths;
+
+  let secret = config.secret();
+  let post_query = req_addr.req_body_query_map().await;
+
+  if let Some(s) = post_query.get("secret") {
+    if s != secret {
+      return Err(ServiceError::new(StatusCode::UNAUTHORIZED, format!("Invalid secret")))
+    }
+  } else {
+    return Err(ServiceError::new(StatusCode::BAD_REQUEST, format!("missing secret")))
   }
 
   let prefix: String;
-  if let Some(s) = req_addr.req_uri_query_map().get("prefix") {
+  if let Some(s) = post_query.get("prefix") {
     prefix = s.to_string();
   } else {
     return Err(ServiceError::new(StatusCode::BAD_REQUEST, format!("missing prefix")))
@@ -207,9 +215,7 @@ async fn update_ip6tables(req_addr: RequestWithAddr, config: Configuration) -> R
     return Err(ServiceError::new(StatusCode::INTERNAL_SERVER_ERROR, format!("failed to write ip6tables rules: {:?} ({})", output_path, err)))
   }
 
-  if let Err(err) = run_ip6tables_restore(output_path).await {
-    return Err(err)
-  }
+  run_ip6tables_restore(output_path).await?;
   log::info!("updated ip6tables rules using global prefix: {}", &prefix);
   Ok(())
 }
@@ -220,21 +226,19 @@ async fn handle_request(req_addr: RequestWithAddr, config: Configuration) -> Res
   let addr = req_addr.addr();
   let method = req_addr.req_method();
   let uri = req_addr.req_uri();
-  let secret = config.secret();
 
-  log::debug!("{}: {} {}", addr, method, uri);
+  log::info!("{}: {} {}", addr, method, uri);
 
-  let target_path = format!("/update/{}", secret);
-  match (method, uri.path().to_string() == target_path) {
-    (&Method::GET, true) => {
+  match (method, uri.path()) {
+    (&Method::GET, "/update") => {
       update_ip6tables(req_addr, config).await
     },
 
-    (_, true) => {
+    (_, "/update") => {
       Err(ServiceError::new(StatusCode::METHOD_NOT_ALLOWED, format!("invalid method: {}", method)))
     },
 
-    (&Method::GET, false) => {
+    (&Method::GET, _) => {
       Err(ServiceError::new(StatusCode::NOT_FOUND, format!("invalid path: {}", uri)))
     },
 
@@ -293,7 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   let server = Server::bind(&addr).serve(make_svc);
 
-  log::info!("Listening on http://{} - awaiting requests at /update/<secret>", &addr);
+  log::info!("Listening on http://{} - awaiting requests at /update", &addr);
   // Run this server for... forever!
   if let Err(e) = server.await {
     log::error!("server error: {}", e);
